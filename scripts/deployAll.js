@@ -1,5 +1,5 @@
 const { etheres } = require('hardhat')
-const { deployContract, sendTxn, writeTmpAddresses, callWithRetries, sleep, getFrameSigner } = require("./shared/helpers")
+const { deployContract, sendTxn, writeTmpAddresses, callWithRetries, sleep, getFrameSigner, execShellCommand } = require("./shared/helpers")
 const { expandDecimals } = require("../test/shared/utilities")
 const network = (process.env.HARDHAT_NETWORK || 'mainnet');
 const gasLimit = 30000000
@@ -7,6 +7,7 @@ const gov = { address: "0x49B373D422BdA4C6BfCdd5eC1E48A9a26fdA2F8b" }
 const { toUsd } = require("../test/shared/units")
 const { errors } = require("../test/core/Vault/helpers");
 const { ADDRESS_ZERO } = require('@uniswap/v3-sdk');
+const { Wallet } = require('ethers');
 const { AddressZero } = ethers.constants
 let weth = { address: "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a" }
 const wallet = { address: "0xcDF2A6446cd43B541fC768195eFE1f82c846F953" }
@@ -14,10 +15,18 @@ const bnAlp = { address: AddressZero }
 const alp = { address: AddressZero }
 const vestingDuration = 365 * 24 * 60 * 60
 
+const maxUint256 = ethers.constants.MaxUint256
+
+function toChainlinkPrice(value) {
+    return parseInt(value * Math.pow(10, 8))
+}
+
 async function main() {
     // const { nativeToken } = tokens
     const [deployer] = await ethers.getSigners()
     wallet.address = deployer.address
+
+    const timelockAdminAddress = deployer.address
 
     const nativeToken = weth
 
@@ -53,6 +62,8 @@ async function main() {
         OrderBook: "",
         OrderBookReader: "",
         TokenManager: "",
+        positionRouter: "",
+        positionManager: "",
     }
 
     // 1 - Reader ------------------------------------------------------------------
@@ -110,7 +121,8 @@ async function main() {
     // 9 - ShortsTracker -----------------------------------------------------------
     const shortsTracker = await deployContract("ShortsTracker", [vault.address], "ShortsTracker", { gasLimit })
     addresses.ShortsTracker = shortsTracker.address
-    await sendTxn(shortsTracker.setGov(gov.address), "shortsTracker.setGov")
+    // TODO
+    await sendTxn(shortsTracker.setGov(wallet.address), "shortsTracker.setGov")
 
     // 10 - GlpManager --------------------------------------------------------------
     const glpManager = await deployContract("GlpManager", [vault.address, usdg.address, glp.address, shortsTracker.address, 15 * 60])
@@ -127,7 +139,7 @@ async function main() {
         router.address, // router
         usdg.address, // usdg
         vaultPriceFeed.address, // priceFeed
-        toUsd(2), // liquidationFeeUsd
+        toUsd(0.01), // liquidationFeeUsd
         100, // fundingRateFactor
         100 // stableFundingRateFactor
     ), "vault.initialize")
@@ -147,7 +159,7 @@ async function main() {
         20, // _swapFeeBasisPoints
         1, // _stableSwapFeeBasisPoints
         10, // _marginFeeBasisPoints
-        toUsd(2), // _liquidationFeeUsd
+        toUsd(0.01), // _liquidationFeeUsd
         24 * 60 * 60, // _minProfitTime
         true // _hasDynamicFees
     ), "vault.setFees")
@@ -452,10 +464,15 @@ async function main() {
 
     const positionRouter = await deployContract("PositionRouter", [vault.address, router.address, nativeToken.address, addresses.ShortsTracker, depositFee, minExecutionFee], "PositionRouter")
 
+    addresses.positionRouter = positionRouter.address;
+
     await sendTxn(positionRouter.setReferralStorage(referralStorage.address), "positionRouter.setReferralStorage")
+    await sendTxn(positionRouter.setPositionKeeper(wallet.address, true), "positionRouter.setReferralStorage")
+
     await sendTxn(referralStorage.setHandler(positionRouter.address, true), "referralStorage.setHandler(positionRouter)")
 
     await sendTxn(router.addPlugin(positionRouter.address), "router.addPlugin")
+    await sendTxn(router.approvePlugin(positionRouter.address), "router.approvePlugin(positionRouter.address)")
 
     await sendTxn(positionRouter.setDelayValues(1, 180, 30 * 60), "positionRouter.setDelayValues")
     // await sendTxn(timelock.setContractHandler(positionRouter.address, true), "timelock.setContractHandler(positionRouter)")
@@ -468,13 +485,21 @@ async function main() {
     const liquidator = { address: wallet.address }
 
     const positionManager = await deployContract("PositionManager", [vault.address, router.address, addresses.ShortsTracker, weth.address, depositFee, orderBook.address])
+
+    addresses.positionManager = positionManager.address;
+
     await sendTxn(positionManager.setOrderKeeper(orderKeeper.address, true), "positionManager.setOrderKeeper(orderKeeper)")
     await sendTxn(positionManager.setLiquidator(liquidator.address, true), "positionManager.setLiquidator(liquidator)")
     await sendTxn(timelock.setContractHandler(positionManager.address, true), "timelock.setContractHandler(positionRouter)")
     // await sendTxn(timelock.setLiquidator(vault.address, positionManager.address, true), "timelock.setLiquidator(vault, positionManager, true)")
     await sendTxn(router.addPlugin(positionManager.address), "router.addPlugin(positionManager)")
+    await sendTxn(router.approvePlugin(positionManager.address), "router.approvePlugin(positionManager.address)")
 
     await sendTxn(glpManager.setHandler(rewardRouter.address, true), 'glpManager.setHandler');
+
+    await sendTxn(shortsTracker.setHandler(positionRouter.address, true), "shortsTracker.setContractHandler(positionManager.address, true)")
+
+    await sendTxn(await glpManager.setInPrivateMode(true), 'glpManager.setInPrivateMode(true)')
 
     console.log(addresses);
 }
